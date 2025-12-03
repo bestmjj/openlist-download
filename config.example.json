@@ -1,0 +1,10 @@
+{
+  "openlist_url": "http://your-openlist-instance.com",
+  "username": "your_username",
+  "password": "your_password",
+  "remote_path": "/path/to/remote/directory",
+  "local_save_dir": "./downloads",
+  "page_size": 200,
+  "timeout": 30,
+  "skip_existing": true
+}
