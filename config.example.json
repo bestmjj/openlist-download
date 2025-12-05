@@ -6,5 +6,9 @@
   "local_save_dir": "./downloads",
   "page_size": 200,
   "timeout": 30,
-  "skip_existing": true
+  "skip_existing": true,
+  "upload": {
+    "local_path": "./uploads",
+    "remote_upload_path": "/path/to/upload/directory"
+  }
 }

@@ -7,6 +7,7 @@
 - 递归列出 OpenList 中的文件
 - 支持多线程下载文件
 - 支持断点续传（跳过已存在的文件）
+- 支持上传本地文件到 OpenList
 - 可配置连接和下载行为选项
 
 ## 配置说明
@@ -22,7 +23,11 @@
   "local_save_dir": "./downloads",
   "page_size": 200,
   "timeout": 30,
-  "skip_existing": true
+  "skip_existing": true,
+  "upload": {
+    "local_path": "./uploads",
+    "remote_upload_path": "/path/to/upload/directory"
+  }
 }
 ```
 
@@ -38,6 +43,8 @@
 | `page_size` | 每次请求获取的项目数 | 200 |
 | `timeout` | 请求超时时间（秒） | 30 |
 | `skip_existing` | 跳过本地已存在的文件 | true |
+| `upload.local_path` | 待上传的本地文件目录 | 上传时必填 |
+| `upload.remote_upload_path` | 上传到的远程目录路径 | 上传时必填 |
 
 ## 使用方法
 
@@ -45,13 +52,14 @@
 
 ```bash
 # python3 src/openlist_downloader/main.py  --help
-usage: main.py [-h] [--list-only] [--download-only] [--workers WORKERS] [--config CONFIG]
+usage: main.py [-h] [--list-only] [--download-only] [--upload-only] [--workers WORKERS] [--config CONFIG]
 
 ### 命令行选项
 options:
   -h, --help         show this help message and exit
   --list-only        仅列出并保存 filelist.json
   --download-only    跳过列目录，使用 filelist.json
+  --upload-only      仅上传本地文件到远程目录
   --workers WORKERS  并发下载线程数(默认: 10)
   --config CONFIG    配置文件路径 (默认: config.json)
 
@@ -107,15 +115,51 @@ options:
 [PROGRESS] 📥 10/10
 [INFO] 🎉 所有下载完成！
 
+# 上传文件
+# python3 src/openlist_downloader/main.py --upload-only
+[INFO] 正在登录到 https://alist...
+[INFO] 登录成功。
+[INFO] 📤 开始上传文件从 ./uploads 到 /cloud189/流媒体/音乐/uploads
+[INFO] 📋 总共找到 3 个文件
+[INFO] 创建目录成功: /cloud189/流媒体/音乐/uploads
+[INFO] 创建目录成功: /cloud189/流媒体/音乐/uploads
+[INFO] 创建目录成功: /cloud189/流媒体/音乐/uploads
+[DEBUG] 上传响应: {'code': 200, 'message': 'success', 'data': None}
+[OK] ✅ 已上传: ./uploads/f3.txt -> /cloud189/流媒体/音乐/uploads/f3.txt
+[DEBUG] 上传响应: {'code': 200, 'message': 'success', 'data': None}
+[OK] ✅ 已上传: ./uploads/f2.txt -> /cloud189/流媒体/音乐/uploads/f2.txt
+[DEBUG] 上传响应: {'code': 200, 'message': 'success', 'data': None}
+[OK] ✅ 已上传: ./uploads/f1.txt -> /cloud189/流媒体/音乐/uploads/f1.txt
+[PROGRESS] 📤 3/3
+[INFO] 🎉 所有上传完成！
+
+### 文件已经存在的会上传失败
+# python3 src/openlist_downloader/main.py --upload-only
+[INFO] 正在登录到 https://alist...
+[INFO] 登录成功。
+[INFO] 📤 开始上传文件从 ./uploads 到 /cloud189/流媒体/音乐/uploads
+[INFO] 📋 总共找到 3 个文件
+[INFO] 创建目录成功: /cloud189/流媒体/音乐/uploads
+[INFO] 创建目录成功: /cloud189/流媒体/音乐/uploads
+[INFO] 创建目录成功: /cloud189/流媒体/音乐/uploads
+[DEBUG] 上传响应: {'code': 403, 'message': 'file exists', 'data': None}
+[ERROR] ❌ 上传失败 f1.txt: {'code': 403, 'message': 'file exists', 'data': None}
+[DEBUG] 上传响应: {'code': 403, 'message': 'file exists', 'data': None}
+[ERROR] ❌ 上传失败 f2.txt: {'code': 403, 'message': 'file exists', 'data': None}
+[DEBUG] 上传响应: {'code': 403, 'message': 'file exists', 'data': None}
+[ERROR] ❌ 上传失败 f3.txt: {'code': 403, 'message': 'file exists', 'data': None}
+[PROGRESS] 📤 3/3
+[INFO] 🎉 所有上传完成！
 ```
 
 ## 工作原理
 
 1. 与 OpenList 实例进行身份验证
-2. 从指定的远程路径递归列出所有文件
-3. 将文件列表保存到 `filelist.json`（除非使用 `--download-only`）
-4. 按照与远程相同的结构将文件下载到本地目录
-5. 通过检查文件大小支持断点续传下载
+2. 根据命令行参数决定执行下载还是上传操作：
+   - 下载：从指定的远程路径递归列出所有文件，按照与远程相同的结构将文件下载到本地目录
+   - 上传：从指定的本地目录递归列出所有文件，按照与本地相同的结构将文件上传到远程目录
+3. 下载过程中通过检查文件大小支持断点续传
+4. 上传过程中自动创建所需的远程目录结构
 
 ## 环境要求
 

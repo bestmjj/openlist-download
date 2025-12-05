@@ -4,7 +4,6 @@
 import os
 import json
 import requests
-from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -25,7 +24,10 @@ class OpenListDownloader:
         self.config_path = config_path
         self.load_config()
         self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "User-Agent": "openlist-downloader/1.0"
+        })
         self.token = None
 
     def load_config(self):
@@ -43,6 +45,9 @@ class OpenListDownloader:
         - page_size: 每页的项目数（默认：200）
         - timeout: 请求超时时间（秒）（默认：30）
         - skip_existing: 跳过现有文件（默认：True）
+        - upload: 上传配置对象（可选）
+          - local_path: 本地待上传文件目录
+          - remote_upload_path: 远程上传目标目录
         """
         with open(self.config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -55,6 +60,7 @@ class OpenListDownloader:
         self.page_size = config.get("page_size", 200)
         self.timeout = config.get("timeout", 30)
         self.skip_existing = config.get("skip_existing", True)
+        self.upload_config = config.get("upload", {})
 
     def login(self):
         """
@@ -314,7 +320,139 @@ class OpenListDownloader:
                 return json.load(f)
         return None
 
-    def run(self, list_only=False, download_only=False, workers=10):
+    def upload_file(self, local_path, remote_path):
+        """
+        上传本地文件到 OpenList 服务器。
+        
+        Args:
+            local_path (str): 本地文件路径
+            remote_path (str): 远程目标路径
+        """
+        if not os.path.exists(local_path):
+            self.print(f"[ERROR] 本地文件不存在: {local_path}")
+            return False
+
+        # 创建目录（如果尚不存在）
+        dir_path = '/'.join(remote_path.split('/')[:-1])
+        if dir_path:
+            self.create_directory(dir_path)
+
+        # 使用 PUT 方法上传文件，模拟浏览器请求
+        try:
+            # 获取文件的最后修改时间
+            import time
+            last_modified = str(int(os.path.getmtime(local_path) * 1000))
+            
+            # 对路径进行URL编码，先UTF-8编码再URL编码
+            encoded_path = requests.utils.quote(remote_path.encode('utf-8'))
+            
+            headers = {
+                "Authorization": self.token,
+                "File-Path": encoded_path,
+                "Last-Modified": last_modified,
+                "Overwrite": "false",
+            }
+            
+            #self.print(f"[DEBUG] 正在使用 PUT 方法上传文件: {local_path} -> {remote_path}")
+            upload_url = f"{self.openlist_url}/api/fs/put"
+            
+            with open(local_path, 'rb') as f:
+                upload_resp = requests.put(upload_url, data=f, headers=headers, timeout=self.timeout)
+                
+                #self.print(f"[DEBUG] 上传响应状态: {upload_resp.status_code}")
+                #self.print(f"[DEBUG] 上传响应头部: {dict(upload_resp.headers)}")
+                
+                # 尝试解析 JSON 响应
+                try:
+                    response_data = upload_resp.json()
+                    self.print(f"[DEBUG] 上传响应: {response_data}")
+                    if upload_resp.status_code in [200, 201, 204]:
+                        if response_data.get("code") == 200:
+                            self.print(f"[OK] ✅ 已上传: {local_path} -> {remote_path}")
+                            return True
+                        else:
+                            # 显示具体的文件名和错误信息
+                            self.print(f"[ERROR] ❌ 上传失败 {os.path.basename(remote_path)}: {response_data}")
+                            return False
+                    else:
+                        self.print(f"[ERROR] ❌ 上传失败，HTTP状态码: {upload_resp.status_code}")
+                        return False
+                except ValueError:
+                    response_text = upload_resp.text[:1000] if upload_resp.text else "Empty response"
+                    self.print(f"[ERROR] ❌ 上传失败，非 JSON 响应 ({upload_resp.status_code}): {response_text}")
+                    return False
+                    
+        except Exception as e:
+            self.print(f"[ERROR] ❌ 上传异常 {os.path.basename(remote_path)}: {e}")
+            return False
+
+    def create_directory(self, path):
+        """
+        在 OpenList 服务器上创建目录。
+        
+        Args:
+            path (str): 要创建的远程目录路径
+        """
+        # 使用直接的requests而不是session，确保使用正确的认证方式
+        headers = {
+            "Authorization": self.token,  # 使用原始token而不是Bearer格式
+            "Content-Type": "application/json",
+            "User-Agent": "openlist-downloader/1.0"
+        }
+            
+        url = f"{self.openlist_url}/api/fs/mkdir"
+        payload = {
+            "path": path,
+            "password": ""
+        }
+        
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+            
+            # 安全地解析 JSON
+            data = None
+            try:
+                data = resp.json()
+            except ValueError:
+                response_preview = resp.text[:500] if resp.text else "Empty response"
+                self.print(f"[ERROR] 创建目录失败，非 JSON 响应（状态 {resp.status_code}）：{response_preview!r}")
+                return False
+            
+            if resp.status_code == 200 and data.get("code") == 200:
+                self.print(f"[INFO] 创建目录成功: {path}")
+                return True
+            elif data and "already exists" in data.get("message", ""):
+                # 目录已存在，这不是错误
+                return True
+            elif resp.status_code == 401:
+                self.print(f"[ERROR] 认证失败: 令牌无效或已过期")
+                return False
+            else:
+                self.print(f"[ERROR] 创建目录失败: {data}")
+                return False
+        except Exception as e:
+            self.print(f"[ERROR] 创建目录异常: {e}")
+            return False
+
+    def list_local_files(self, local_path):
+        """
+        列出本地目录中的所有文件。
+        
+        Args:
+            local_path (str): 本地目录路径
+            
+        Returns:
+            list: 文件路径列表
+        """
+        files = []
+        for root, _, filenames in os.walk(local_path):
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, local_path)
+                files.append((full_path, rel_path))
+        return files
+
+    def run(self, list_only=False, download_only=False, upload_only=False, workers=10):
         """
         运行下载器进程。
         
@@ -323,9 +461,46 @@ class OpenListDownloader:
         Args:
             list_only (bool): 如果为 True，则仅列出文件并保存到 filelist.json
             download_only (bool): 如果为 True，则跳过列目录并从现有的 filelist.json 下载
+            upload_only (bool): 如果为 True，则只上传文件
             workers (int): 并发下载线程数。默认为 10。
         """
         self.login()
+
+        if upload_only:
+            # 处理上传任务
+            local_upload_path = self.upload_config.get("local_path")
+            remote_upload_path = self.upload_config.get("remote_upload_path")
+            
+            if not local_upload_path or not remote_upload_path:
+                raise ValueError("上传模式需要在配置文件中指定 local_path 和 remote_upload_path")
+                
+            if not os.path.exists(local_upload_path):
+                raise FileNotFoundError(f"本地上传目录不存在: {local_upload_path}")
+                
+            self.print(f"[INFO] 📤 开始上传文件从 {local_upload_path} 到 {remote_upload_path}")
+            local_files = self.list_local_files(local_upload_path)
+            
+            if not local_files:
+                self.print("[WARN] ⚠️ 未找到要上传的文件。")
+                return
+                
+            self.print(f"[INFO] 📋 总共找到 {len(local_files)} 个文件")
+            
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = []
+                for local_file, rel_path in local_files:
+                    remote_file = os.path.join(remote_upload_path, rel_path).replace("\\", "/")
+                    futures.append(executor.submit(self.upload_file, local_file, remote_file))
+                    
+                completed = 0
+                total = len(futures)
+                for _ in as_completed(futures):
+                    completed += 1
+                    if completed % 10 == 0 or completed == total:
+                        self.print(f"[PROGRESS] 📤 {completed}/{total}")
+                        
+            self.print("[INFO] 🎉 所有上传完成！")
+            return
 
         if download_only:
             self.print("[INFO] 📥 使用现有的 filelist.json")
