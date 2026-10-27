@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import threading
 from unittest.mock import patch
 from openlist_downloader.progress import TransferProgress, format_eta, format_size
 from openlist_downloader.downloader import OpenListDownloader
@@ -59,7 +60,8 @@ class DownloadTests(unittest.TestCase):
     def setUp(self):
         self.obj = OpenListDownloader.__new__(OpenListDownloader)
         self.obj.timeout = 30
-        self.obj._print_lock = __import__("threading").Lock()
+        self.obj._print_lock = threading.Lock()
+        self.obj._stop_event = threading.Event()
         self.logs = []
         self.obj.print = self.logs.append
 
@@ -91,6 +93,31 @@ class DownloadTests(unittest.TestCase):
         self.assertTrue(any("下载跳转域名：openlist.example.test -> cdn.example.test" in line for line in self.logs))
         self.assertNotIn("hidden-value", "\n".join(self.logs))
         self.assertNotIn("private-key", "\n".join(self.logs))
+
+    @patch("openlist_downloader.downloader.requests.request")
+    def test_interrupt_stops_writing_and_preserves_part(self, request):
+        def chunks():
+            yield b"abc"
+            self.obj._stop_event.set()
+            yield b"def"
+        request.return_value = FakeResponse(chunks())
+        with tempfile.TemporaryDirectory() as directory:
+            dst = os.path.join(directory, "video.mp4")
+            self.assertFalse(self.obj._download_stream("https://example.com", dst, 6))
+            self.assertFalse(os.path.exists(dst))
+            with open(dst + ".part", "rb") as file:
+                self.assertEqual(file.read(), b"abc")
+            self.assertFalse(any("已保存" in line for line in self.logs))
+
+    def test_ctrl_c_cancels_pending_work_and_sets_stop_signal(self):
+        self.obj.login = lambda: None
+        self.obj.load_filelist = lambda: [{"path": "/test"}]
+        self.obj.local_save_dir = "/tmp"
+        self.obj.download_file = lambda path, local: True
+        with patch("openlist_downloader.downloader.as_completed", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.obj.run(download_only=True, workers=1)
+        self.assertTrue(self.obj._stop_event.is_set())
 
     @patch("openlist_downloader.downloader.requests.request")
     def test_incomplete_download_keeps_final_untouched(self, request):
