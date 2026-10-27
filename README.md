@@ -154,6 +154,27 @@ options:
 [INFO] 🎉 所有上传完成！
 ```
 
+## 阿里云盘直链测速（Debian）
+
+当下载任务使用 `raw_url`，但速度明显低于浏览器时，先停止正在运行的下载任务，再使用：
+
+```bash
+git pull --ff-only origin main
+python3 src/openlist_downloader/main.py --diagnose-speed
+```
+
+测速会从 `filelist.json`（若不存在则扫描 `remote_path`）选择一个文件，获取一次新的直链，在**当前 Debian 主机**上分别测量：
+
+- Python 默认网络配置（与正常下载器相同，会读取代理环境变量）
+- Python 忽略环境代理
+- curl IPv4 直连（也忽略代理）
+
+每次仅请求前 2 MiB，下载数据不会保存到磁盘，不会打印带签名的完整 URL。若服务端不支持 Range，会显示 HTTP 200 提醒；curl 会限制最大接收量，防止把整个文件下载下来。
+
+如果 3 种方式都很慢，优先排查 Debian 到阿里云盘 CDN 的路由、出口 IP 或服务端限速；如果仅默认 Python 慢，检查 HTTP(S) 代理；如果 curl 快而 Python 慢，进一步比较请求头及客户端网络栈。不同机器上的浏览器和 Debian 并不构成同一网络条件的对照。
+
+下载时可按一次 `Ctrl+C` 停止：下载任务会取消排队中的文件，并让正在运行的任务在下一次收到网络数据时停止，未完成的数据仍保存在 `.part` 文件内。若网络读取阻塞，退出仍受请求超时约束。暂未实现真正的 HTTP Range 断点续传。
+
 ## 工作原理
 
 1. 与 OpenList 实例进行身份验证
