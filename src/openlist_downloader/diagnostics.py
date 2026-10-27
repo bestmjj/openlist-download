@@ -11,7 +11,10 @@ import time
 
 import requests
 
-from .progress import format_size
+try:
+    from .progress import format_size
+except ImportError:
+    from progress import format_size
 
 
 PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
