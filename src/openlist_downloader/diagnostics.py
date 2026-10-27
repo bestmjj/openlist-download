@@ -101,7 +101,7 @@ def probe_curl_ipv4(url, sample_bytes, timeout):
         "curl", "--silent", "--show-error", "--location", "--http1.1",
         "--ipv4", "--noproxy", "*",
         "--range", "0-{}".format(sample_bytes - 1),
-        "--max-filesize", str(sample_bytes * 2),
+        "--max-filesize", str(sample_bytes),
         "--connect-timeout", "10", "--max-time", str(max_seconds),
         "--output", "/dev/null", "--write-out",
         "%{http_code} %{size_download} %{time_total}",
@@ -116,7 +116,7 @@ def probe_curl_ipv4(url, sample_bytes, timeout):
         if len(parts) != 3:
             return _result(error="curl 退出码 {}".format(done.returncode))
         status = int(parts[0])
-        received = min(sample_bytes * 2, int(float(parts[1])))
+        received = min(sample_bytes, int(float(parts[1])))
         elapsed = float(parts[2])
         error = "curl 退出码 {}".format(done.returncode) if done.returncode else None
         return _result(status, received, elapsed, error)
