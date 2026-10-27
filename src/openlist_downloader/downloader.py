@@ -5,7 +5,10 @@ import os
 import json
 import requests
 import threading
-from .progress import TransferProgress
+try:
+    from .progress import TransferProgress
+except ImportError:
+    from progress import TransferProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -246,12 +249,13 @@ class OpenListDownloader:
 
         return self._download_via_stream(remote_path, local_path, expected_size)
 
-    def _download_stream(self, url, local_path, expected_size=None, method="get", payload=None):
+    def _download_stream(self, url, local_path, expected_size=None, method="get", payload=None, authenticated=False):
         """Stream into a .part file and promote only after full size validation."""
         part_path = local_path + ".part"
         # A previous partial download is discarded: this code does NOT yet support
         # HTTP Range resume. Avoid claiming resumability without validating 206.
-        with requests.request(method, url, json=payload, stream=True, timeout=self.timeout) as response:
+        client = self.session if authenticated else requests
+        with client.request(method, url, json=payload, stream=True, timeout=self.timeout) as response:
             response.raise_for_status()
             response_size = response.headers.get("Content-Length")
             response_size = int(response_size) if response_size and response_size.isdigit() else None
@@ -281,7 +285,7 @@ class OpenListDownloader:
             return self._download_stream(
                 "{}/api/fs/stream".format(self.openlist_url),
                 local_path, expected_size, method="post",
-                payload={"path": remote_path, "password": ""},
+                payload={"path": remote_path, "password": ""}, authenticated=True,
             )
         except (requests.RequestException, OSError, ValueError) as exc:
             self.print("[ERROR] ❌ 下载失败 {}：{}".format(remote_path, exc))
