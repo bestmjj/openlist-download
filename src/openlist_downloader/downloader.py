@@ -5,6 +5,7 @@ import os
 import json
 import requests
 import threading
+from urllib.parse import urlparse
 try:
     from .progress import TransferProgress
 except ImportError:
@@ -242,6 +243,7 @@ class OpenListDownloader:
 
         if raw_url:
             self.print("[DOWNLOAD] 🔗 使用 raw_url：{}".format(remote_path))
+            self.print("[DEBUG] raw_url 域名：{}".format(urlparse(raw_url).hostname or "未知"))
             try:
                 return self._download_stream(raw_url, local_path, expected_size)
             except (requests.RequestException, OSError, ValueError) as exc:
@@ -256,6 +258,14 @@ class OpenListDownloader:
         # HTTP Range resume. Avoid claiming resumability without validating 206.
         client = self.session if authenticated else requests
         with client.request(method, url, json=payload, stream=True, timeout=self.timeout) as response:
+            # Never log the full URL: signed download URLs may contain secrets.
+            response_url = getattr(response, "url", None) or url
+            final_domain = urlparse(response_url).hostname or "未知"
+            redirect_domains = [urlparse(hop.url).hostname or "未知" for hop in getattr(response, "history", [])]
+            if redirect_domains:
+                self.print("[DEBUG] 下载跳转域名：{}".format(" -> ".join(redirect_domains + [final_domain])))
+            else:
+                self.print("[DEBUG] 实际下载域名：{}".format(final_domain))
             response.raise_for_status()
             response_size = response.headers.get("Content-Length")
             response_size = int(response_size) if response_size and response_size.isdigit() else None
