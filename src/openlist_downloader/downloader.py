@@ -7,6 +7,10 @@ import requests
 import threading
 from urllib.parse import urlparse
 try:
+    from .diagnostics import active_proxy_environment, describe_probe, probe_python, probe_curl_ipv4
+except ImportError:
+    from diagnostics import active_proxy_environment, describe_probe, probe_python, probe_curl_ipv4
+try:
     from .progress import TransferProgress
 except ImportError:
     from progress import TransferProgress
@@ -36,6 +40,7 @@ class OpenListDownloader:
         })
         self.token = None
         self._print_lock = threading.Lock()
+        self._stop_event = threading.Event()
 
     def load_config(self):
         """
@@ -223,6 +228,8 @@ class OpenListDownloader:
 
     def download_file(self, remote_path, local_path):
         """Download with per-file speed, percent and ETA; never expose partial final files."""
+        if self._stop_event.is_set():
+            return False
         os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
         expected_size = self.get_file_size(remote_path)
         if self.skip_existing and os.path.isfile(local_path) and expected_size is not None:
@@ -256,6 +263,8 @@ class OpenListDownloader:
         part_path = local_path + ".part"
         # A previous partial download is discarded: this code does NOT yet support
         # HTTP Range resume. Avoid claiming resumability without validating 206.
+        if self._stop_event.is_set():
+            return False
         client = self.session if authenticated else requests
         with client.request(method, url, json=payload, stream=True, timeout=self.timeout) as response:
             # Never log the full URL: signed download URLs may contain secrets.
@@ -276,6 +285,8 @@ class OpenListDownloader:
             try:
                 with open(part_path, "wb") as output:
                     for chunk in response.iter_content(chunk_size=65536):
+                        if self._stop_event.is_set():
+                            return False
                         if chunk:
                             output.write(chunk)
                             progress.update(len(chunk))
@@ -300,6 +311,50 @@ class OpenListDownloader:
         except (requests.RequestException, OSError, ValueError) as exc:
             self.print("[ERROR] ❌ 下载失败 {}：{}".format(remote_path, exc))
             return False
+
+    def diagnose_speed(self):
+        """Compare identical CDN URL on the same Debian host without saving data."""
+        all_files = self.load_filelist()
+        if not all_files:
+            all_files = self.list_dir(self.remote_path)
+        if not all_files:
+            raise ValueError("没有可供测速的文件")
+        # Prefer a file large enough for the 2-MiB sample.
+        file_info = next(
+            (item for item in all_files if int(item.get("size") or 0) >= 2097152),
+            all_files[0],
+        )
+        path = file_info["path"]
+        sample_size = min(2097152, int(file_info.get("size") or 2097152))
+        if sample_size <= 0:
+            raise ValueError("测速文件大小为零")
+
+        response = self.session.post(
+            "{}/api/fs/get".format(self.openlist_url),
+            json={"path": path, "password": ""}, timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code") != 200 or not isinstance(result.get("data"), dict):
+            raise ValueError("无法获取测速文件的下载信息")
+        raw_url = result["data"].get("raw_url")
+        if not raw_url or urlparse(raw_url).scheme not in ("http", "https"):
+            raise ValueError("未取得有效 HTTP 下载链接")
+
+        self.print("[DIAG] 文件：{}".format(os.path.basename(path)))
+        self.print("[DIAG] raw_url 域名：{}".format(urlparse(raw_url).hostname or "未知"))
+        self.print("[DIAG] 测试上限：每种方式 2 MiB，不会保存文件")
+        proxies = active_proxy_environment()
+        self.print("[DIAG] 代理环境变量：{}".format(", ".join(proxies) if proxies else "未设置"))
+        for label, bypass in (("Python 当前网络配置", False), ("Python 不使用环境代理", True)):
+            measurement = probe_python(raw_url, sample_size, self.timeout, bypass_proxy=bypass)
+            self.print(describe_probe(label, measurement))
+            if measurement["status"] == 200:
+                self.print("[DIAG] 注意：该请求返回 HTTP 200，可能没有遵循 Range 请求")
+        measurement = probe_curl_ipv4(raw_url, sample_size, self.timeout)
+        self.print(describe_probe("curl IPv4 直连（不使用代理）", measurement))
+        if measurement["status"] == 200:
+            self.print("[DIAG] 注意：curl 测试收到 HTTP 200，可能没有遵循 Range 请求")
 
     def save_filelist(self, filelist, path="filelist.json"):
         """
@@ -460,7 +515,7 @@ class OpenListDownloader:
                 files.append((full_path, rel_path))
         return files
 
-    def run(self, list_only=False, download_only=False, upload_only=False, workers=10):
+    def run(self, list_only=False, download_only=False, upload_only=False, workers=10, diagnose_speed=False):
         """
         运行下载器进程。
         
@@ -472,7 +527,12 @@ class OpenListDownloader:
             upload_only (bool): 如果为 True，则只上传文件
             workers (int): 并发下载线程数。默认为 10。
         """
+        self._stop_event.clear()
         self.login()
+
+        if diagnose_speed:
+            self.diagnose_speed()
+            return
 
         if upload_only:
             # 处理上传任务
@@ -542,15 +602,24 @@ class OpenListDownloader:
             completed = 0
             failed = 0
             total = len(futures)
-            for future in as_completed(futures):
-                completed += 1
-                try:
-                    if not future.result():
+            try:
+                for future in as_completed(futures):
+                    completed += 1
+                    try:
+                        if not future.result():
+                            failed += 1
+                    except Exception as exc:
                         failed += 1
-                except Exception as exc:
-                    failed += 1
-                    self.print(f"[ERROR] 下载任务异常：{exc}")
-                if completed % 20 == 0 or completed == total:
-                    self.print(f"[PROGRESS] 📥 {completed}/{total}（失败 {failed}）")
+                        self.print(f"[ERROR] 下载任务异常：{exc}")
+                    if completed % 20 == 0 or completed == total:
+                        self.print(f"[PROGRESS] 📥 {completed}/{total}（失败 {failed}）")
+            except KeyboardInterrupt:
+                self._stop_event.set()
+                for future in futures:
+                    future.cancel()
+                self.print("[INFO] 正在取消下载并关闭连接...")
+                # The with block waits only for the running workers. They check
+                # the cancellation flag before writing each next block.
+                raise
 
         self.print(f"[INFO] 下载结束：成功/跳过 {total - failed}，失败 {failed}")
