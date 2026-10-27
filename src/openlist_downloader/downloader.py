@@ -4,6 +4,12 @@
 import os
 import json
 import requests
+import threading
+from urllib.parse import urlparse
+try:
+    from .progress import TransferProgress
+except ImportError:
+    from progress import TransferProgress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -29,6 +35,7 @@ class OpenListDownloader:
             "User-Agent": "openlist-downloader/1.0"
         })
         self.token = None
+        self._print_lock = threading.Lock()
 
     def load_config(self):
         """
@@ -108,10 +115,11 @@ class OpenListDownloader:
         Args:
             msg (str): 要打印的消息
         """
-        try:
-            print(msg)
-        except UnicodeEncodeError:
-            print(msg.encode("utf-8", errors="replace").decode("utf-8"))
+        with self._print_lock:
+            try:
+                print(msg, flush=True)
+            except UnicodeEncodeError:
+                print(msg.encode("utf-8", errors="replace").decode("utf-8"), flush=True)
 
     def list_dir(self, path):
         """
@@ -214,84 +222,84 @@ class OpenListDownloader:
         return None
 
     def download_file(self, remote_path, local_path):
-        """
-        从 OpenList 下载文件到本地存储。
-        
-        首先尝试使用原始 URL 下载，如果失败则回退到流方法。
-        如果启用了 skip_existing 且文件大小匹配，则跳过现有文件。
-        
-        Args:
-            remote_path (str): 远程文件的路径
-            local_path (str): 保存文件的本地路径
-        """
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        """Download with per-file speed, percent and ETA; never expose partial final files."""
+        os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+        expected_size = self.get_file_size(remote_path)
+        if self.skip_existing and os.path.isfile(local_path) and expected_size is not None:
+            if os.path.getsize(local_path) == expected_size:
+                self.print("[SKIP] ✅ 已存在：{}".format(local_path))
+                return True
 
-        if self.skip_existing and os.path.exists(local_path):
-            local_size = os.path.getsize(local_path)
-            if local_size > 0:
-                remote_size = self.get_file_size(remote_path)
-                if remote_size is not None and local_size == remote_size:
-                    self.print(f"[SKIP] ✅ 已存在：{local_path}")
-                    return
-
-        # 首先尝试 raw_url
-        url = f"{self.openlist_url}/api/fs/get"
+        url = "{}/api/fs/get".format(self.openlist_url)
         payload = {"path": remote_path, "password": ""}
         try:
-            resp = self.session.post(url, json=payload, timeout=self.timeout)
-            # 安全地解析 JSON
-            data = None
+            response = self.session.post(url, json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            result = response.json()
+            raw_url = result.get("data", {}).get("raw_url") if result.get("code") == 200 else None
+        except (requests.RequestException, ValueError, AttributeError) as exc:
+            self.print("[WARN] 获取直链失败，尝试流模式：{}".format(exc))
+            raw_url = None
+
+        if raw_url:
+            self.print("[DOWNLOAD] 🔗 使用 raw_url：{}".format(remote_path))
+            self.print("[DEBUG] raw_url 域名：{}".format(urlparse(raw_url).hostname or "未知"))
             try:
-                data = resp.json()
-            except ValueError:
-                data = None
+                return self._download_stream(raw_url, local_path, expected_size)
+            except (requests.RequestException, OSError, ValueError) as exc:
+                self.print("[WARN] 直链下载失败，尝试流模式：{}".format(exc))
 
-            if resp.status_code != 200 or not data or data.get("code") != 200:
-                # 如果响应不可用，则回退到流
-                self._download_via_stream(remote_path, local_path)
-                return
+        return self._download_via_stream(remote_path, local_path, expected_size)
 
-            raw_url = data["data"].get("raw_url")
-            if not raw_url:
-                self._download_via_stream(remote_path, local_path)
-                return
-
-            self.print(f"[DOWNLOAD] 🔗 使用 raw_url：{remote_path}")
-            with requests.get(raw_url, stream=True, timeout=self.timeout) as r:
-                if r.status_code != 200:
-                    self.print(f"[ERROR] ❌ raw_url 失败（{r.status_code}）")
-                    return
-                with open(local_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        f.write(chunk)
-            self.print(f"[OK] ✅ 已保存：{local_path}")
-
-        except Exception as e:
-            self.print(f"[ERROR] ❌ 下载失败：{e}")
-
-    def _download_via_stream(self, remote_path, local_path):
-        """
-        使用流 API 下载文件。
-        
-        当直接下载失败时使用的私有回退方法。
-        
-        Args:
-            remote_path (str): 远程文件的路径
-            local_path (str): 保存文件的本地路径
-        """
-        url = f"{self.openlist_url}/api/fs/stream"
-        payload = {"path": remote_path, "password": ""}
-        try:
-            resp = self.session.post(url, json=payload, stream=True, timeout=self.timeout)
-            if resp.status_code == 200:
-                with open(local_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        f.write(chunk)
-                self.print(f"[OK] ✅ 通过流已保存：{local_path}")
+    def _download_stream(self, url, local_path, expected_size=None, method="get", payload=None, authenticated=False):
+        """Stream into a .part file and promote only after full size validation."""
+        part_path = local_path + ".part"
+        # A previous partial download is discarded: this code does NOT yet support
+        # HTTP Range resume. Avoid claiming resumability without validating 206.
+        client = self.session if authenticated else requests
+        with client.request(method, url, json=payload, stream=True, timeout=self.timeout) as response:
+            # Never log the full URL: signed download URLs may contain secrets.
+            response_url = getattr(response, "url", None) or url
+            final_domain = urlparse(response_url).hostname or "未知"
+            redirect_domains = [urlparse(hop.url).hostname or "未知" for hop in getattr(response, "history", [])]
+            if redirect_domains:
+                self.print("[DEBUG] 下载跳转域名：{}".format(" -> ".join(redirect_domains + [final_domain])))
             else:
-                self.print(f"[ERROR] ❌ 流失败（{resp.status_code}）")
-        except Exception as e:
-            self.print(f"[ERROR] ❌ 流异常：{e}")
+                self.print("[DEBUG] 实际下载域名：{}".format(final_domain))
+            response.raise_for_status()
+            response_size = response.headers.get("Content-Length")
+            response_size = int(response_size) if response_size and response_size.isdigit() else None
+            if expected_size is not None and response_size is not None and response_size != expected_size:
+                raise ValueError("文件大小不一致：远端={} 响应={}".format(expected_size, response_size))
+            total = expected_size if expected_size is not None else response_size
+            progress = TransferProgress(local_path, total, self.print)
+            try:
+                with open(part_path, "wb") as output:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if chunk:
+                            output.write(chunk)
+                            progress.update(len(chunk))
+                if total is not None and progress.downloaded != total:
+                    raise ValueError("文件下载不完整：期望 {}，实际 {}".format(total, progress.downloaded))
+                os.replace(part_path, local_path)
+                progress.finish()
+                self.print("[OK] ✅ 已保存：{}".format(local_path))
+                return True
+            except Exception:
+                # Preserve .part for inspection; never treat it as a finished file.
+                raise
+
+    def _download_via_stream(self, remote_path, local_path, expected_size=None):
+        """Fallback to OpenList's stream API with the same progress reporter."""
+        try:
+            return self._download_stream(
+                "{}/api/fs/stream".format(self.openlist_url),
+                local_path, expected_size, method="post",
+                payload={"path": remote_path, "password": ""}, authenticated=True,
+            )
+        except (requests.RequestException, OSError, ValueError) as exc:
+            self.print("[ERROR] ❌ 下载失败 {}：{}".format(remote_path, exc))
+            return False
 
     def save_filelist(self, filelist, path="filelist.json"):
         """
@@ -532,10 +540,17 @@ class OpenListDownloader:
                 futures.append(executor.submit(self.download_file, file_info["path"], local_file))
 
             completed = 0
+            failed = 0
             total = len(futures)
-            for _ in as_completed(futures):
+            for future in as_completed(futures):
                 completed += 1
+                try:
+                    if not future.result():
+                        failed += 1
+                except Exception as exc:
+                    failed += 1
+                    self.print(f"[ERROR] 下载任务异常：{exc}")
                 if completed % 20 == 0 or completed == total:
-                    self.print(f"[PROGRESS] 📥 {completed}/{total}")
+                    self.print(f"[PROGRESS] 📥 {completed}/{total}（失败 {failed}）")
 
-        self.print("[INFO] 🎉 所有下载完成！")
+        self.print(f"[INFO] 下载结束：成功/跳过 {total - failed}，失败 {failed}")
