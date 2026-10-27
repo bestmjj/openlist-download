@@ -8,6 +8,8 @@ from openlist_downloader.downloader import OpenListDownloader
 
 class FakeResponse:
     headers = {"Content-Length": "6"}
+    url = "https://cdn.example.test/media?signature=private-key"
+    history = []
 
     def __init__(self, chunks):
         self.chunks = chunks
@@ -71,6 +73,24 @@ class DownloadTests(unittest.TestCase):
                 self.assertEqual(file.read(), b"abcdef")
             self.assertFalse(os.path.exists(dst + ".part"))
             self.assertTrue(any("100.0%" in line for line in self.logs))
+            self.assertTrue(any("实际下载域名：cdn.example.test" in line for line in self.logs))
+            self.assertNotIn("private-key", "\n".join(self.logs))
+
+    @patch("openlist_downloader.downloader.requests.request")
+    def test_redirect_domains_logged_without_signed_url(self, request):
+        from types import SimpleNamespace
+
+        redirect_response = FakeResponse([b"abc", b"def"])
+        redirect_response.history = [
+            SimpleNamespace(url="https://openlist.example.test/p/file?sign=hidden-value"),
+        ]
+        request.return_value = redirect_response
+        with tempfile.TemporaryDirectory() as directory:
+            dst = os.path.join(directory, "video.mp4")
+            self.assertTrue(self.obj._download_stream("https://openlist.example.test/p/file", dst, 6))
+        self.assertTrue(any("下载跳转域名：openlist.example.test -> cdn.example.test" in line for line in self.logs))
+        self.assertNotIn("hidden-value", "\n".join(self.logs))
+        self.assertNotIn("private-key", "\n".join(self.logs))
 
     @patch("openlist_downloader.downloader.requests.request")
     def test_incomplete_download_keeps_final_untouched(self, request):
