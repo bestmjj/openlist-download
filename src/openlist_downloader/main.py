@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--download-only", action="store_true", help="跳过列目录，使用 filelist.json")
     parser.add_argument("--upload-only", action="store_true", help="仅上传本地文件到远程目录")
     parser.add_argument("--workers", type=int, default=10, help="并发线程数(默认: 10)")
+    parser.add_argument("--diagnose-speed", action="store_true", help="测量同一网盘直链的 Python 与 curl 速度（每种方式最多读取 2 MiB）")
     parser.add_argument("--config", default="config.json", help="配置文件路径 (默认: config.json)")
     args = parser.parse_args()
 
@@ -39,7 +40,8 @@ def main():
             list_only=args.list_only,
             download_only=args.download_only,
             upload_only=args.upload_only,
-            workers=args.workers
+            workers=args.workers,
+            diagnose_speed=args.diagnose_speed
         )
     except KeyboardInterrupt:
         print("\n[INFO] ⏹️ 用户中断。")
